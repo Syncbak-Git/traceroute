@@ -148,7 +148,7 @@ type Continuous struct {
 // NewContinuous returns a new Continuous for monitoring the
 // supplied destinations using the default options. The supplied Logger, if non-nil,
 // will be used for logging.
-func NewContinous(destinations []string, logger *log.Logger) *Continuous {
+func NewContinuous(destinations []string, logger *log.Logger) *Continuous {
 	if logger == nil {
 		d := discard.New()
 		logger = &log.Logger{
@@ -158,10 +158,13 @@ func NewContinous(destinations []string, logger *log.Logger) *Continuous {
 		}
 	}
 	return &Continuous{
-		Timeout:      5 * time.Second,
-		MaxTTL:       64,
+		Timeout: 5 * time.Second,
+		// TODO: revert this
+		// MaxTTL:       64,
+		MaxTTL:       15,
 		FirstPort:    33434,
 		Destinations: destinations,
+		logger:       logger,
 	}
 }
 
@@ -184,12 +187,15 @@ func (c *Continuous) Run(ctx context.Context) error {
 		// again, this is fatal
 		return err
 	}
-	tv := syscall.NsecToTimeval(int64(c.Timeout))
-	err = syscall.SetsockoptTimeval(recvSocket, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
-	if err != nil {
-		// this one isn't really fatal, but we'll treat it as so, because it's a really bad sign
-		return err
-	}
+	// TODO: do we need a receive timeout if we're running continuously?
+	// we do, if we want ctx.Done() to exit the recvfrom loop, otherwise it blocks forever
+	// once we stop sending requests
+	// tv := syscall.NsecToTimeval(int64(c.Timeout))
+	// err = syscall.SetsockoptTimeval(recvSocket, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+	// if err != nil {
+	// 	// this one isn't really fatal, but we'll treat it as so, because it's a really bad sign
+	// 	return err
+	// }
 	// set up the sending sockets
 	// we'll use one send socket per TTL value, reusing it across destinations
 	sockets := make(map[int]int)
@@ -208,8 +214,8 @@ func (c *Continuous) Run(ctx context.Context) error {
 	// launch the listener
 	messages := make(chan *Hop, 1)
 	go func() {
-		var p = make([]byte, 100)
 		for ctx.Err() == nil {
+			var p = make([]byte, 100)
 			n, _, err := syscall.Recvfrom(recvSocket, p, 0)
 			now := time.Now().UTC()
 			if err != nil {
@@ -237,16 +243,16 @@ func (c *Continuous) Run(ctx context.Context) error {
 	var generation int
 	for ctx.Err() == nil {
 		generation++
-		port := c.FirstPort - 1
 		for _, dest := range c.Destinations {
+			port := c.FirstPort - 1
 			delete(inProgress, dest)
-			port++
 			addr, err := ipAddress(dest)
 			if err != nil {
 				c.logger.WithError(err).WithField("address", dest).Error("could not resolve address")
 				continue
 			}
 			for ttl, socket := range sockets {
+				port++
 				p := packet{
 					start: time.Now().UTC(),
 					ttl:   ttl,
@@ -265,7 +271,7 @@ func (c *Continuous) Run(ctx context.Context) error {
 		}
 		// TODO: we could keep more than one generation in inProgress, and we could distinguish
 		// the responses using the source port
-		for begin := time.Now().UTC(); time.Since(begin) < 2*c.Timeout; {
+		for begin := time.Now().UTC(); time.Since(begin) < c.Timeout; {
 			var err error
 			msg := <-messages
 			packets, ok := inProgress[msg.Dst.String()]
@@ -286,6 +292,7 @@ func (c *Continuous) Run(ctx context.Context) error {
 			if !found && err == nil {
 				err = fmt.Errorf("no matching in progress record")
 			}
+			fmt.Println(msg.String())
 			c.logger.WithError(err).WithField("generation", generation).WithFields(msg).Action("traceroute")
 		}
 	}

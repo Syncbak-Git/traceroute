@@ -1,4 +1,4 @@
-module github.com/aeden/traceroute
+module github.com/Syncbak-Git/traceroute
 
 go 1.14
 
