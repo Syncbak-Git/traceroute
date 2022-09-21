@@ -243,6 +243,7 @@ func (c *Continuous) Run(ctx context.Context) error {
 	var generation int
 	for ctx.Err() == nil {
 		generation++
+		fmt.Println("GENERATION", generation)
 		for _, dest := range c.Destinations {
 			port := c.FirstPort - 1
 			delete(inProgress, dest)
@@ -272,6 +273,7 @@ func (c *Continuous) Run(ctx context.Context) error {
 		// TODO: we could keep more than one generation in inProgress, and we could distinguish
 		// the responses using the source port
 		for begin := time.Now().UTC(); time.Since(begin) < c.Timeout; {
+			fmt.Println("LOOP", begin.String(), time.Since(begin), c.Timeout)
 			var err error
 			msg := <-messages
 			packets, ok := inProgress[msg.Dst.String()]
@@ -292,9 +294,9 @@ func (c *Continuous) Run(ctx context.Context) error {
 			if !found && err == nil {
 				err = fmt.Errorf("no matching in progress record")
 			}
-			fmt.Println(msg.String())
 			c.logger.WithError(err).WithField("generation", generation).WithFields(msg).Action("traceroute")
 		}
+		fmt.Println("LOOP FINISHED")
 	}
 	return ctx.Err()
 }
