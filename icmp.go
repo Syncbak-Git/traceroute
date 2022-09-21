@@ -168,9 +168,8 @@ func NewContinuous(destinations []string, logger *log.Logger) *Continuous {
 	}
 }
 
-// Run runs a continous traceroute to the Continuous.Destinations. Except for
-// initialization errors, Run will not return until the supplied context is Done.
-func (c *Continuous) Run(ctx context.Context) error {
+func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
+	defer close(hops)
 	localAddr, err := findAddress()
 	if err != nil {
 		return err
@@ -182,11 +181,6 @@ func (c *Continuous) Run(ctx context.Context) error {
 		return err
 	}
 	defer syscall.Close(recvSocket)
-	err = syscall.Bind(recvSocket, &syscall.SockaddrInet4{Port: c.FirstPort, Addr: localAddr})
-	if err != nil {
-		// again, this is fatal
-		return err
-	}
 	// TODO: do we need a receive timeout if we're running continuously?
 	// we do, if we want ctx.Done() to exit the recvfrom loop, otherwise it blocks forever
 	// once we stop sending requests
@@ -196,6 +190,42 @@ func (c *Continuous) Run(ctx context.Context) error {
 	// 	// this one isn't really fatal, but we'll treat it as so, because it's a really bad sign
 	// 	return err
 	// }
+	err = syscall.Bind(recvSocket, &syscall.SockaddrInet4{Port: c.FirstPort, Addr: localAddr})
+	if err != nil {
+		// again, this is fatal
+		return err
+	}
+	for ctx.Err() == nil {
+		var p = make([]byte, 100)
+		n, _, err := syscall.Recvfrom(recvSocket, p, 0)
+		now := time.Now().UTC()
+		if err != nil {
+			c.logger.WithError(err).Error("Recvfrom error")
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		msg, err := extractMessage(p[:n], now)
+		if err != nil {
+			c.logger.WithError(err).Error("extractMessage error")
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		hops <- msg
+	}
+	return ctx.Err()
+}
+
+type packet struct {
+	start      time.Time
+	ttl        int
+	dest       string
+	port       int
+	generation int
+	address    string
+}
+
+func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) error {
+	defer close(jobs)
 	// set up the sending sockets
 	// we'll use one send socket per TTL value, reusing it across destinations
 	sockets := make(map[int]int)
@@ -211,72 +241,72 @@ func (c *Continuous) Run(ctx context.Context) error {
 		}
 		sockets[ttl] = socket
 	}
-	// launch the listener
-	messages := make(chan *Hop, 1)
-	go func() {
-		for ctx.Err() == nil {
-			var p = make([]byte, 100)
-			n, _, err := syscall.Recvfrom(recvSocket, p, 0)
-			now := time.Now().UTC()
-			if err != nil {
-				c.logger.WithError(err).Error("Recvfrom error")
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			msg, err := extractMessage(p[:n], now)
-			if err != nil {
-				c.logger.WithError(err).Error("extractMessage error")
-				time.Sleep(10 * time.Millisecond)
-				continue
-			}
-			messages <- msg
-		}
-	}()
-	type packet struct {
-		start time.Time
-		ttl   int
-		dest  string
-		port  int
-	}
-	inProgress := map[string][]packet{}
-	payload := []byte{0x00}
+	newGeneration := time.NewTicker(c.Timeout)
+	defer newGeneration.Stop()
 	var generation int
-	for ctx.Err() == nil {
-		generation++
-		fmt.Println("GENERATION", generation)
-		for _, dest := range c.Destinations {
-			port := c.FirstPort - 1
-			delete(inProgress, dest)
-			addr, err := ipAddress(dest)
-			if err != nil {
-				c.logger.WithError(err).WithField("address", dest).Error("could not resolve address")
-				continue
-			}
-			for ttl, socket := range sockets {
-				port++
-				p := packet{
-					start: time.Now().UTC(),
-					ttl:   ttl,
-					dest:  dest,
-					port:  port,
-				}
-				var b [4]byte
-				copy(b[:], addr.To4())
-				inProgress[addr.String()] = append(inProgress[addr.String()], p)
-				err := syscall.Sendto(socket, payload, 0, &syscall.SockaddrInet4{Port: port, Addr: b})
+	payload := []byte{0x00}
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-newGeneration.C:
+			generation++
+			c.logger.Debugf("NewGeneration: %d", generation)
+			for _, dest := range c.Destinations {
+				port := c.FirstPort - 1
+				addr, err := ipAddress(dest)
 				if err != nil {
-					c.logger.WithError(err).WithField("address", dest).Error("Sendto error")
+					c.logger.WithError(err).WithField("address", dest).Error("could not resolve address")
 					continue
 				}
+				for ttl, socket := range sockets {
+					port++
+					p := packet{
+						start:      time.Now().UTC(),
+						ttl:        ttl,
+						dest:       dest,
+						port:       port,
+						generation: generation,
+						address:    addr.String(),
+					}
+					var b [4]byte
+					copy(b[:], addr.To4())
+					err := syscall.Sendto(socket, payload, 0, &syscall.SockaddrInet4{Port: port, Addr: b})
+					if err != nil {
+						c.logger.WithError(err).WithField("address", dest).Error("Sendto error")
+						continue
+					}
+					jobs <- p
+				}
 			}
 		}
-		// TODO: we could keep more than one generation in inProgress, and we could distinguish
-		// the responses using the source port
-		for begin := time.Now().UTC(); time.Since(begin) < c.Timeout; {
-			fmt.Println("LOOP", begin.String(), time.Since(begin), c.Timeout)
+	}
+}
+
+// Run runs a continous traceroute to the Continuous.Destinations. Except for
+// initialization errors, Run will not return until the supplied context is Done.
+func (c *Continuous) Run(ctx context.Context) error {
+	// launch the listener
+	messages := make(chan *Hop, 1)
+	go c.readICMP(ctx, messages)
+	jobs := make(chan packet, 1)
+	go c.generatePackets(ctx, jobs)
+	inProgress := map[string][]packet{}
+	var generation int
+	report := map[string][]*Hop{}
+	doReport := time.NewTicker(c.Timeout * 3)
+	defer doReport.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case msg, ok := <-messages:
+			if !ok {
+				return errors.New("message channel closed")
+			}
+			key := msg.Dst.String()
 			var err error
-			msg := <-messages
-			packets, ok := inProgress[msg.Dst.String()]
+			packets, ok := inProgress[key]
 			if !ok {
 				err = fmt.Errorf("no matching in progress address")
 			}
@@ -295,8 +325,16 @@ func (c *Continuous) Run(ctx context.Context) error {
 				err = fmt.Errorf("no matching in progress record")
 			}
 			c.logger.WithError(err).WithField("generation", generation).WithFields(msg).Action("traceroute")
+			report[key] = append(report[key], msg)
+			fmt.Println(msg.String())
+		case p, ok := <-jobs:
+			if !ok {
+				return errors.New("jobs channel closed")
+			}
+			inProgress[p.address] = append(inProgress[p.address], p)
+		case <-doReport.C:
+			// TODO: create a report from the latest set of messages
+			// then, purge the old ones
 		}
-		fmt.Println("LOOP FINISHED")
 	}
-	return ctx.Err()
 }
