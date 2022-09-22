@@ -1,11 +1,13 @@
 package traceroute
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"syscall"
 	"time"
 
@@ -65,6 +67,8 @@ type Hop struct {
 	Dst net.IP
 	// Node is the node at this step of the route.
 	Node net.IP
+	// NodeName is the DNS name of the node.
+	NodeName string
 	// Step is the location of this node in the route, ie the TTL value used.
 	Step int
 	// DstPort is the destination port targeted.
@@ -80,7 +84,8 @@ type Hop struct {
 }
 
 func (r *Hop) String() string {
-	return fmt.Sprintf("Src: %s, Dst: %s, Node: %s, Step: %d, Elapsed: %s, Port: %d", r.Src.String(), r.Dst.String(), r.Node.String(), r.Step, r.Elapsed.String(), r.DstPort)
+	return fmt.Sprintf("Src: %s, Dst: %s (%s), Node: %s (%s), Step: %d, Elapsed: %s, Port: %d",
+		r.Src.String(), r.DstAddr, r.Dst.String(), r.NodeName, r.Node.String(), r.Step, r.Elapsed.String(), r.DstPort)
 }
 
 func (r *Hop) Fields() log.Fields {
@@ -88,6 +93,7 @@ func (r *Hop) Fields() log.Fields {
 		"src":      r.Src.String(),
 		"dst":      r.Dst.String(),
 		"node":     r.Node.String(),
+		"nodename": r.NodeName,
 		"step":     r.Step,
 		"dstport":  r.DstPort,
 		"dstaddr":  r.DstAddr,
@@ -127,10 +133,18 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 		return nil, fmt.Errorf("source udp header too short: %d", len(udpHeader))
 	}
 	dstPort := binary.BigEndian.Uint16(udpHeader[2:4])
+	var name string
+	names, _ := net.LookupAddr(replyHeader.Src.String())
+	if len(names) > 0 {
+		name = names[0]
+	} else {
+		name = replyHeader.Src.String()
+	}
 	return &Hop{
 		Src:      srcHeader.Src,
 		Dst:      srcHeader.Dst,
 		Node:     replyHeader.Src,
+		NodeName: name,
 		DstPort:  int(dstPort),
 		Received: now,
 	}, nil
@@ -138,11 +152,12 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 
 // Continuous does a continous traceroute for a set of destinations.
 type Continuous struct {
-	Timeout      time.Duration
-	MaxTTL       int
-	FirstPort    int
-	Destinations []string
-	logger       *log.Logger
+	Timeout       time.Duration
+	MaxTTL        int
+	FirstPort     int
+	Destinations  []string
+	PayloadLength int
+	logger        *log.Logger
 }
 
 // NewContinuous returns a new Continuous for monitoring the
@@ -161,10 +176,11 @@ func NewContinuous(destinations []string, logger *log.Logger) *Continuous {
 		Timeout: 5 * time.Second,
 		// TODO: revert this
 		// MaxTTL:       64,
-		MaxTTL:       15,
-		FirstPort:    33434,
-		Destinations: destinations,
-		logger:       logger,
+		MaxTTL:        15,
+		FirstPort:     33434,
+		Destinations:  destinations,
+		PayloadLength: 1,
+		logger:        logger,
 	}
 }
 
@@ -244,7 +260,7 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 	newGeneration := time.NewTicker(c.Timeout)
 	defer newGeneration.Stop()
 	var generation int
-	payload := []byte{0x00}
+	payload := bytes.Repeat([]byte{0x00}, c.PayloadLength)
 	for {
 		select {
 		case <-ctx.Done():
@@ -283,9 +299,41 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 	}
 }
 
+func (c *Continuous) makeReports(data map[string][]*Hop) []Report {
+	fmt.Println("MAKE", len(data))
+	var all []Report
+	for destination, hops := range data {
+		fmt.Println("DEST", destination)
+		if len(hops) > 0 {
+			destination = hops[0].DstAddr
+		}
+		r := c.newReport(destination, hops)
+		all = append(all, r)
+	}
+	return all
+}
+
+func (c *Continuous) newReport(destination string, hops []*Hop) Report {
+	sort.Slice(hops, func(a, b int) bool {
+		aa := hops[a]
+		bb := hops[b]
+		if aa.Step == bb.Step {
+			// we use Received because Sent could be empty
+			return aa.Received.Before(bb.Received)
+		}
+		return hops[a].Step < hops[b].Step
+	})
+	return Report{
+		Destination:  destination,
+		Hops:         hops,
+		MaxHops:      c.MaxTTL,
+		PacketLength: c.PayloadLength + 20 + 8, // 20 for IP header, 8 for UDP header
+	}
+}
+
 // Run runs a continous traceroute to the Continuous.Destinations. Except for
 // initialization errors, Run will not return until the supplied context is Done.
-func (c *Continuous) Run(ctx context.Context) error {
+func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) error {
 	// launch the listener
 	messages := make(chan *Hop, 1)
 	go c.readICMP(ctx, messages)
@@ -293,9 +341,7 @@ func (c *Continuous) Run(ctx context.Context) error {
 	go c.generatePackets(ctx, jobs)
 	inProgress := map[string][]packet{}
 	var generation int
-	report := map[string][]*Hop{}
-	doReport := time.NewTicker(c.Timeout * 3)
-	defer doReport.Stop()
+	hops := map[string][]*Hop{}
 	for {
 		select {
 		case <-ctx.Done():
@@ -325,16 +371,17 @@ func (c *Continuous) Run(ctx context.Context) error {
 				err = fmt.Errorf("no matching in progress record")
 			}
 			c.logger.WithError(err).WithField("generation", generation).WithFields(msg).Action("traceroute")
-			report[key] = append(report[key], msg)
-			fmt.Println(msg.String())
+			hops[key] = append(hops[key], msg)
+			// TODO: purge the old ones
 		case p, ok := <-jobs:
 			if !ok {
 				return errors.New("jobs channel closed")
 			}
 			inProgress[p.address] = append(inProgress[p.address], p)
-		case <-doReport.C:
-			// TODO: create a report from the latest set of messages
-			// then, purge the old ones
+			// TODO: purge the old ones
+		case fn := <-reports:
+			r := c.makeReports(hops)
+			fn(r)
 		}
 	}
 }
