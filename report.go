@@ -7,30 +7,27 @@ import (
 )
 
 type Report struct {
-	Destination  string
+	Destination  Addr
 	MaxHops      int
 	PacketLength int
 	Hops         []*Hop
+	Generations  int
 }
 
 func (r Report) String() string {
-	fmt.Println("HOPS", len(r.Hops))
 	type entry struct {
-		step      int
-		name      string
-		address   string
-		durations []time.Duration
+		step          int
+		name          string
+		address       string
+		durations     []time.Duration
+		atDestination bool
 	}
-	var ipAddr string
-	// we want to coalesce the hops, so that ones with the same address show multiple durations
+	// we want to coalesce the hops, so that ones with the same IP address show multiple durations
 	all := make(map[int][]entry)
 	for _, hop := range r.Hops {
-		if len(ipAddr) == 0 {
-			ipAddr = hop.Src.String()
-		}
 		var found bool
 		for i, e := range all[hop.Step] {
-			if e.name == hop.NodeName {
+			if e.name == hop.Node.Host {
 				all[hop.Step][i].durations = append(all[hop.Step][i].durations, hop.Elapsed)
 				found = true
 				break
@@ -38,44 +35,41 @@ func (r Report) String() string {
 		}
 		if !found {
 			e := entry{
-				step:      hop.Step,
-				name:      hop.NodeName,
-				address:   hop.Node.String(),
-				durations: []time.Duration{hop.Elapsed},
+				step:          hop.Step,
+				name:          hop.Node.Host,
+				address:       hop.Node.IP.String(),
+				durations:     []time.Duration{hop.Elapsed},
+				atDestination: hop.icmpType == 3,
 			}
 			all[hop.Step] = append(all[hop.Step], e)
 		}
 	}
-	var tries int
-	for _, step := range all {
-		var count int
-		for _, e := range step {
-			count += len(e.durations)
-		}
-		if count > tries {
-			tries = count
-		}
-	}
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("traceroute to %s (%s), %d hops max, %d byte packets\n", r.Destination, ipAddr, r.MaxHops, r.PacketLength))
+	sb.WriteString(fmt.Sprintf("traceroute to %s (%s), %d hops max, %d byte packets\n",
+		r.Destination.Host, r.Destination.IP.String(), r.MaxHops, r.PacketLength))
 	if len(all) == 0 {
 		sb.WriteString(fmt.Sprintf("No data\n"))
 	} else {
 		for i := 1; i < r.MaxHops; i++ {
 			sb.WriteString(fmt.Sprintf("%d\t", i))
 			var count int
+			var done bool
 			for _, e := range all[i] {
+				done = done || e.atDestination
 				sb.WriteString(fmt.Sprintf("%s\t(%s)\t", e.name, e.address))
 				for _, d := range e.durations {
 					sb.WriteString(fmt.Sprintf("%.3f ms\t", 1000*d.Seconds()))
 					count++
 				}
 			}
-			for count < tries {
+			for count < r.Generations {
 				sb.WriteString(fmt.Sprintf("*\t"))
 				count++
 			}
 			sb.WriteString(fmt.Sprintf("\n"))
+			if done {
+				break
+			}
 		}
 	}
 	// 1  router.home (192.168.1.1)  0.372 ms  0.403 ms  0.453 ms

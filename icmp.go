@@ -17,6 +17,81 @@ import (
 	"golang.org/x/net/icmp"
 )
 
+type Addr struct {
+	// Host is the host (ie, DNS) name of the node.
+	Host string
+	// IP is the IP address of the node.
+	IP net.IP
+}
+
+// Continuous does a continous traceroute for a set of destinations.
+type Continuous struct {
+	Timeout       time.Duration
+	MaxTTL        int
+	FirstPort     int
+	PortRange     int
+	Destinations  []Addr
+	Generations   int
+	PayloadLength int
+	logger        *log.Logger
+}
+
+// NewContinuous returns a new Continuous for monitoring the
+// supplied destinations using the default options. The supplied Logger, if non-nil,
+// will be used for logging.
+func NewContinuous(destinations []string, logger *log.Logger) (*Continuous, error) {
+	if logger == nil {
+		d := discard.New()
+		logger = &log.Logger{
+			Handler:       d,
+			ActionHandler: d,
+			Level:         0,
+		}
+	}
+	dest := make([]Addr, len(destinations))
+	for i, host := range destinations {
+		ip, err := ipAddress(host)
+		if err != nil {
+			return nil, fmt.Errorf("could not resolve %s: %s", host, err)
+		}
+		dest[i] = Addr{Host: host, IP: ip}
+	}
+	return &Continuous{
+		Timeout:       5 * time.Second,
+		MaxTTL:        30,
+		FirstPort:     33434,
+		PortRange:     1024,
+		Destinations:  dest,
+		Generations:   3,
+		PayloadLength: 1,
+		logger:        logger,
+	}, nil
+}
+
+// Hop is a step in the network route between a source and destination address.
+type Hop struct {
+	// Src is the source (ie, local) address.
+	Src Addr
+	// Dst is the destination (ie, remote) address.
+	Dst Addr
+	// Node is the node at this step of the route.
+	Node Addr
+	// Step is the location of this node in the route, ie the TTL value used.
+	Step int
+	// DstPort is the destination port targeted.
+	DstPort int
+	// Sent is the time the query began.
+	Sent time.Time
+	// Received is the time the query completed.
+	Received time.Time
+	// Elapsed is the duration of the query.
+	Elapsed time.Duration
+	// Generation is the cycle counter.
+	Generation int
+	// icmpType is the ICMP Type value.
+	icmpType int
+}
+
 func findAddress() (addr [4]byte, err error) {
 	ip, err := gateway.DiscoverInterface()
 	if err != nil {
@@ -59,47 +134,25 @@ func ipAddress(dest string) (net.IP, error) {
 	return ipAddr.IP, nil
 }
 
-// Hop is a step in the network route between a source and destination address.
-type Hop struct {
-	// Src is the source (ie, local) address.
-	Src net.IP
-	// Dst is the destination (ie, remote) address.
-	Dst net.IP
-	// Node is the node at this step of the route.
-	Node net.IP
-	// NodeName is the DNS name of the node.
-	NodeName string
-	// Step is the location of this node in the route, ie the TTL value used.
-	Step int
-	// DstPort is the destination port targeted.
-	DstPort int
-	// DstAddr` is the destination address targeted.
-	DstAddr string
-	// Sent is the time the query began.
-	Sent time.Time
-	// Received is the time the query completed.
-	Received time.Time
-	// Elapsed is the duration of the query.
-	Elapsed time.Duration
-}
-
 func (r *Hop) String() string {
-	return fmt.Sprintf("Src: %s, Dst: %s (%s), Node: %s (%s), Step: %d, Elapsed: %s, Port: %d",
-		r.Src.String(), r.DstAddr, r.Dst.String(), r.NodeName, r.Node.String(), r.Step, r.Elapsed.String(), r.DstPort)
+	return fmt.Sprintf("Src: %s, Dst: %s (%s), Node: %s (%s), Step: %d, Elapsed: %s, Port: %d, Generation: %d, Type: %d",
+		r.Src.IP.String(), r.Dst.Host, r.Dst.IP.String(), r.Node.Host, r.Node.IP.String(), r.Step, r.Elapsed.String(), r.DstPort, r.Generation, r.icmpType)
 }
 
 func (r *Hop) Fields() log.Fields {
 	return map[string]interface{}{
-		"src":      r.Src.String(),
-		"dst":      r.Dst.String(),
-		"node":     r.Node.String(),
-		"nodename": r.NodeName,
-		"step":     r.Step,
-		"dstport":  r.DstPort,
-		"dstaddr":  r.DstAddr,
-		"sent":     r.Sent.Format(time.RFC3339Nano),
-		"received": r.Received.Format(time.RFC3339Nano),
-		"elapsed":  r.Elapsed.Seconds(),
+		"srchost":    r.Src.Host,
+		"srcip":      r.Src.IP.String(),
+		"dsthost":    r.Dst.Host,
+		"dstip":      r.Dst.IP.String(),
+		"nodehost":   r.Node.Host,
+		"nodeip":     r.Node.IP.String(),
+		"step":       r.Step,
+		"dstport":    r.DstPort,
+		"sent":       r.Sent.Format(time.RFC3339Nano),
+		"received":   r.Received.Format(time.RFC3339Nano),
+		"elapsed":    r.Elapsed.Seconds(),
+		"generation": r.Generation,
 	}
 }
 
@@ -114,6 +167,7 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 	if err != nil {
 		return nil, err
 	}
+	icmpType := int(p[replyHeader.Len])
 	var data []byte
 	if te, ok := msg.Body.(*icmp.TimeExceeded); ok {
 		data = te.Data
@@ -141,47 +195,20 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 		name = replyHeader.Src.String()
 	}
 	return &Hop{
-		Src:      srcHeader.Src,
-		Dst:      srcHeader.Dst,
-		Node:     replyHeader.Src,
-		NodeName: name,
+		Src: Addr{
+			IP: srcHeader.Src,
+		},
+		Dst: Addr{
+			IP: srcHeader.Dst,
+		},
+		Node: Addr{
+			Host: name,
+			IP:   replyHeader.Src,
+		},
 		DstPort:  int(dstPort),
 		Received: now,
+		icmpType: icmpType,
 	}, nil
-}
-
-// Continuous does a continous traceroute for a set of destinations.
-type Continuous struct {
-	Timeout       time.Duration
-	MaxTTL        int
-	FirstPort     int
-	Destinations  []string
-	PayloadLength int
-	logger        *log.Logger
-}
-
-// NewContinuous returns a new Continuous for monitoring the
-// supplied destinations using the default options. The supplied Logger, if non-nil,
-// will be used for logging.
-func NewContinuous(destinations []string, logger *log.Logger) *Continuous {
-	if logger == nil {
-		d := discard.New()
-		logger = &log.Logger{
-			Handler:       d,
-			ActionHandler: d,
-			Level:         0,
-		}
-	}
-	return &Continuous{
-		Timeout: 5 * time.Second,
-		// TODO: revert this
-		// MaxTTL:       64,
-		MaxTTL:        15,
-		FirstPort:     33434,
-		Destinations:  destinations,
-		PayloadLength: 1,
-		logger:        logger,
-	}
 }
 
 func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
@@ -234,10 +261,22 @@ func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
 type packet struct {
 	start      time.Time
 	ttl        int
-	dest       string
+	dest       Addr
 	port       int
 	generation int
-	address    string
+}
+
+func (c *Continuous) nextPort(prev int) int {
+	var p int
+	if prev == 0 {
+		p = c.FirstPort
+	} else {
+		p = prev + 1
+	}
+	if p > c.FirstPort+c.PortRange {
+		p = c.FirstPort
+	}
+	return p
 }
 
 func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) error {
@@ -261,6 +300,7 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 	defer newGeneration.Stop()
 	var generation int
 	payload := bytes.Repeat([]byte{0x00}, c.PayloadLength)
+	var port int
 	for {
 		select {
 		case <-ctx.Done():
@@ -268,28 +308,30 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 		case <-newGeneration.C:
 			generation++
 			c.logger.Debugf("NewGeneration: %d", generation)
-			for _, dest := range c.Destinations {
-				port := c.FirstPort - 1
-				addr, err := ipAddress(dest)
-				if err != nil {
-					c.logger.WithError(err).WithField("address", dest).Error("could not resolve address")
-					continue
+			for i, dest := range c.Destinations {
+				if generation > 0 && generation%c.Generations == 0 {
+					// update the destination IP address every few generations
+					addr, err := ipAddress(dest.Host)
+					if err != nil {
+						c.logger.WithError(err).WithField("address", dest.Host).Error("could not resolve address")
+					} else {
+						c.Destinations[i].IP = addr
+					}
 				}
 				for ttl, socket := range sockets {
-					port++
+					port = c.nextPort(port)
 					p := packet{
 						start:      time.Now().UTC(),
 						ttl:        ttl,
 						dest:       dest,
 						port:       port,
 						generation: generation,
-						address:    addr.String(),
 					}
 					var b [4]byte
-					copy(b[:], addr.To4())
+					copy(b[:], dest.IP.To4())
 					err := syscall.Sendto(socket, payload, 0, &syscall.SockaddrInet4{Port: port, Addr: b})
 					if err != nil {
-						c.logger.WithError(err).WithField("address", dest).Error("Sendto error")
+						c.logger.WithError(err).WithField("address", dest.Host).Error("Sendto error")
 						continue
 					}
 					jobs <- p
@@ -300,12 +342,17 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 }
 
 func (c *Continuous) makeReports(data map[string][]*Hop) []Report {
-	fmt.Println("MAKE", len(data))
 	var all []Report
-	for destination, hops := range data {
-		fmt.Println("DEST", destination)
+	for host, hops := range data {
+		var destination Addr
 		if len(hops) > 0 {
-			destination = hops[0].DstAddr
+			destination = hops[0].Dst
+		} else {
+			ip, _ := ipAddress(host)
+			destination = Addr{
+				Host: host,
+				IP:   ip,
+			}
 		}
 		r := c.newReport(destination, hops)
 		all = append(all, r)
@@ -313,7 +360,7 @@ func (c *Continuous) makeReports(data map[string][]*Hop) []Report {
 	return all
 }
 
-func (c *Continuous) newReport(destination string, hops []*Hop) Report {
+func (c *Continuous) newReport(destination Addr, hops []*Hop) Report {
 	sort.Slice(hops, func(a, b int) bool {
 		aa := hops[a]
 		bb := hops[b]
@@ -321,13 +368,18 @@ func (c *Continuous) newReport(destination string, hops []*Hop) Report {
 			// we use Received because Sent could be empty
 			return aa.Received.Before(bb.Received)
 		}
-		return hops[a].Step < hops[b].Step
+		if aa.Generation == bb.Generation {
+			return aa.Step < bb.Step
+		}
+		return aa.Generation < bb.Generation
 	})
+	// TODO: copy hops, filtering out any outside the generation window
 	return Report{
 		Destination:  destination,
 		Hops:         hops,
 		MaxHops:      c.MaxTTL,
 		PacketLength: c.PayloadLength + 20 + 8, // 20 for IP header, 8 for UDP header
+		Generations:  c.Generations,
 	}
 }
 
@@ -340,7 +392,6 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 	jobs := make(chan packet, 1)
 	go c.generatePackets(ctx, jobs)
 	inProgress := map[string][]packet{}
-	var generation int
 	hops := map[string][]*Hop{}
 	for {
 		select {
@@ -350,9 +401,8 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 			if !ok {
 				return errors.New("message channel closed")
 			}
-			key := msg.Dst.String()
 			var err error
-			packets, ok := inProgress[key]
+			packets, ok := inProgress[msg.Dst.IP.String()]
 			if !ok {
 				err = fmt.Errorf("no matching in progress address")
 			}
@@ -362,22 +412,25 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 					found = true
 					msg.Sent = p.start
 					msg.Step = p.ttl
-					msg.DstAddr = p.dest
+					msg.Dst.Host = p.dest.Host
 					msg.Elapsed = msg.Received.Sub(msg.Sent)
+					msg.Generation = p.generation
 					break
 				}
 			}
 			if !found && err == nil {
 				err = fmt.Errorf("no matching in progress record")
 			}
-			c.logger.WithError(err).WithField("generation", generation).WithFields(msg).Action("traceroute")
-			hops[key] = append(hops[key], msg)
+			c.logger.WithError(err).WithFields(msg).Action("traceroute")
+			if err == nil {
+				hops[msg.Dst.Host] = append(hops[msg.Dst.Host], msg)
+			}
 			// TODO: purge the old ones
 		case p, ok := <-jobs:
 			if !ok {
 				return errors.New("jobs channel closed")
 			}
-			inProgress[p.address] = append(inProgress[p.address], p)
+			inProgress[p.dest.IP.String()] = append(inProgress[p.dest.IP.String()], p)
 			// TODO: purge the old ones
 		case fn := <-reports:
 			r := c.makeReports(hops)
