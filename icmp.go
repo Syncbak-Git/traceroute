@@ -341,39 +341,63 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 	}
 }
 
-func (c *Continuous) makeReports(data map[string][]*Hop) []Report {
+// ErrMissingHost occurs when we try to process a response for a destination
+// that's not in the list of destinations.
+var ErrMissingHost error = errors.New("missing host")
+
+func (c *Continuous) makeReports(data map[string]map[int][]*Hop) []Report {
 	var all []Report
-	for host, hops := range data {
-		var destination Addr
-		if len(hops) > 0 {
-			destination = hops[0].Dst
-		} else {
-			ip, _ := ipAddress(host)
-			destination = Addr{
-				Host: host,
-				IP:   ip,
+	for host, generations := range data {
+		var ip net.IP
+		for _, dest := range c.Destinations {
+			if dest.Host == host {
+				ip = dest.IP
+				break
 			}
 		}
-		r := c.newReport(destination, hops)
+		if ip == nil {
+			// this should never happen, so log it
+			c.logger.WithError(ErrMissingHost).WithField("host", host).Error("missinghost")
+			ip, _ = ipAddress(host)
+		}
+		addr := Addr{
+			Host: host,
+			IP:   ip,
+		}
+		r := c.newReport(addr, generations)
 		all = append(all, r)
 	}
 	return all
 }
 
-func (c *Continuous) newReport(destination Addr, hops []*Hop) Report {
+func (c *Continuous) newReport(destination Addr, generations map[int][]*Hop) Report {
+	var first, last int
+	for gen := range generations {
+		if first == 0 || gen < first {
+			first = gen
+		}
+		if gen > last {
+			last = gen
+		}
+	}
+	// we're going to treat the last generation as open-ended, because it's
+	// almost certainly still in progress. So, last-first gives us the count
+	// of _available_ generations (rather than being off by one).
+	for last-first > c.Generations {
+		first++
+	}
+	var hops []*Hop
+	for gen := first; gen < last; gen++ {
+		hops = append(hops, generations[gen]...)
+	}
 	sort.Slice(hops, func(a, b int) bool {
 		aa := hops[a]
 		bb := hops[b]
-		if aa.Step == bb.Step {
-			// we use Received because Sent could be empty
-			return aa.Received.Before(bb.Received)
-		}
 		if aa.Generation == bb.Generation {
 			return aa.Step < bb.Step
 		}
 		return aa.Generation < bb.Generation
 	})
-	// TODO: copy hops, filtering out any outside the generation window
 	return Report{
 		Destination:  destination,
 		Hops:         hops,
@@ -391,8 +415,8 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 	go c.readICMP(ctx, messages)
 	jobs := make(chan packet, 1)
 	go c.generatePackets(ctx, jobs)
-	inProgress := map[string][]packet{}
-	hops := map[string][]*Hop{}
+	inProgress := map[int]packet{}
+	hops := map[string]map[int][]*Hop{} // hops by generation by destination
 	for {
 		select {
 		case <-ctx.Done():
@@ -402,35 +426,34 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 				return errors.New("message channel closed")
 			}
 			var err error
-			packets, ok := inProgress[msg.Dst.IP.String()]
+			p, ok := inProgress[msg.DstPort]
 			if !ok {
 				err = fmt.Errorf("no matching in progress address")
-			}
-			var found bool
-			for _, p := range packets {
-				if p.port == msg.DstPort {
-					found = true
-					msg.Sent = p.start
-					msg.Step = p.ttl
-					msg.Dst.Host = p.dest.Host
-					msg.Elapsed = msg.Received.Sub(msg.Sent)
-					msg.Generation = p.generation
-					break
-				}
-			}
-			if !found && err == nil {
-				err = fmt.Errorf("no matching in progress record")
+			} else {
+				msg.Sent = p.start
+				msg.Step = p.ttl
+				msg.Dst.Host = p.dest.Host
+				msg.Elapsed = msg.Received.Sub(msg.Sent)
+				msg.Generation = p.generation
+				delete(inProgress, msg.DstPort)
 			}
 			c.logger.WithError(err).WithFields(msg).Action("traceroute")
-			if err == nil {
-				hops[msg.Dst.Host] = append(hops[msg.Dst.Host], msg)
+			if ok {
+				key := msg.Dst.Host
+				_, ok := hops[key]
+				if !ok {
+					hops[key] = map[int][]*Hop{}
+				}
+				messages := hops[key][msg.Generation]
+				messages = append(messages, msg)
+				hops[key][msg.Generation] = messages
 			}
 			// TODO: purge the old ones
 		case p, ok := <-jobs:
 			if !ok {
 				return errors.New("jobs channel closed")
 			}
-			inProgress[p.dest.IP.String()] = append(inProgress[p.dest.IP.String()], p)
+			inProgress[p.port] = p
 			// TODO: purge the old ones
 		case fn := <-reports:
 			r := c.makeReports(hops)
