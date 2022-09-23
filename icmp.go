@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"math"
 	"net"
 	"sort"
 	"syscall"
@@ -78,6 +79,9 @@ type Hop struct {
 	Node Addr
 	// Step is the location of this node in the route, ie the TTL value used.
 	Step int
+	// ID is a unique ID that is used to match the original request with the ICMP response.
+	// It can be derived from either the request or the response.
+	ID string
 	// DstPort is the destination port targeted.
 	DstPort int
 	// Sent is the time the query began.
@@ -135,8 +139,8 @@ func ipAddress(dest string) (net.IP, error) {
 }
 
 func (r *Hop) String() string {
-	return fmt.Sprintf("Src: %s, Dst: %s (%s), Node: %s (%s), Step: %d, Elapsed: %s, Port: %d, Generation: %d, Type: %d",
-		r.Src.IP.String(), r.Dst.Host, r.Dst.IP.String(), r.Node.Host, r.Node.IP.String(), r.Step, r.Elapsed.String(), r.DstPort, r.Generation, r.icmpType)
+	return fmt.Sprintf("Src: %s, Dst: %s (%s), Node: %s (%s), Step: %d, Elapsed: %s, ID: %s, Generation: %d, Type: %d",
+		r.Src.IP.String(), r.Dst.Host, r.Dst.IP.String(), r.Node.Host, r.Node.IP.String(), r.Step, r.Elapsed.String(), r.ID, r.Generation, r.icmpType)
 }
 
 func (r *Hop) Fields() log.Fields {
@@ -148,7 +152,7 @@ func (r *Hop) Fields() log.Fields {
 		"nodehost":   r.Node.Host,
 		"nodeip":     r.Node.IP.String(),
 		"step":       r.Step,
-		"dstport":    r.DstPort,
+		"id":         r.ID,
 		"sent":       r.Sent.Format(time.RFC3339Nano),
 		"received":   r.Received.Format(time.RFC3339Nano),
 		"elapsed":    r.Elapsed.Seconds(),
@@ -156,7 +160,7 @@ func (r *Hop) Fields() log.Fields {
 	}
 }
 
-func extractMessage(p []byte, now time.Time) (*Hop, error) {
+func (c *Continuous) extractMessage(p []byte, now time.Time) (*Hop, error) {
 	// get the reply IPv4 header. That will have the node address
 	replyHeader, err := icmp.ParseIPv4Header(p)
 	if err != nil {
@@ -186,6 +190,7 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 	if len(udpHeader) < 8 {
 		return nil, fmt.Errorf("source udp header too short: %d", len(udpHeader))
 	}
+	srcPort := binary.BigEndian.Uint16(udpHeader[0:2])
 	dstPort := binary.BigEndian.Uint16(udpHeader[2:4])
 	var name string
 	names, _ := net.LookupAddr(replyHeader.Src.String())
@@ -194,6 +199,7 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 	} else {
 		name = replyHeader.Src.String()
 	}
+	id := c.packetID(srcHeader.ID, srcHeader.Dst, int(srcPort), int(dstPort))
 	return &Hop{
 		Src: Addr{
 			IP: srcHeader.Src,
@@ -205,8 +211,8 @@ func extractMessage(p []byte, now time.Time) (*Hop, error) {
 			Host: name,
 			IP:   replyHeader.Src,
 		},
-		DstPort:  int(dstPort),
 		Received: now,
+		ID:       id,
 		icmpType: icmpType,
 	}, nil
 }
@@ -241,19 +247,23 @@ func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
 	for ctx.Err() == nil {
 		var p = make([]byte, 100)
 		n, _, err := syscall.Recvfrom(recvSocket, p, 0)
-		now := time.Now().UTC()
 		if err != nil {
 			c.logger.WithError(err).Error("Recvfrom error")
 			time.Sleep(10 * time.Millisecond)
-			continue
+		} else {
 		}
-		msg, err := extractMessage(p[:n], now)
-		if err != nil {
-			c.logger.WithError(err).Error("extractMessage error")
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		hops <- msg
+		go func(p []byte, n int, err error) {
+			now := time.Now().UTC()
+			if err != nil {
+				return
+			}
+			msg, err := c.extractMessage(p[:n], now)
+			if err != nil {
+				c.logger.WithError(err).Error("extractMessage error")
+				return
+			}
+			hops <- msg
+		}(p, n, err)
 	}
 	return ctx.Err()
 }
@@ -264,6 +274,7 @@ type packet struct {
 	dest       Addr
 	port       int
 	generation int
+	id         string
 }
 
 func (c *Continuous) nextPort(prev int) int {
@@ -279,28 +290,24 @@ func (c *Continuous) nextPort(prev int) int {
 	return p
 }
 
+func (c *Continuous) packetID(ipHeaderID int, destIP net.IP, srcPort, destPort int) string {
+	return fmt.Sprintf("%d|%s|%d|%d", ipHeaderID, destIP.String(), srcPort, destPort)
+}
+
 func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) error {
 	defer close(jobs)
-	// set up the sending sockets
-	// we'll use one send socket per TTL value, reusing it across destinations
-	sockets := make(map[int]int)
-	for ttl := 1; ttl <= c.MaxTTL; ttl++ {
-		socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM, syscall.IPPROTO_UDP)
-		if err != nil {
-			return err
-		}
-		defer syscall.Close(socket)
-		err = syscall.SetsockoptInt(socket, 0x0, syscall.IP_TTL, ttl)
-		if err != nil {
-			return err
-		}
-		sockets[ttl] = socket
+	// set up the sending socket
+	socket, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW, syscall.IPPROTO_RAW)
+	if err != nil {
+		return err
 	}
+	defer syscall.Close(socket)
 	newGeneration := time.NewTicker(c.Timeout)
 	defer newGeneration.Stop()
 	var generation int
 	payload := bytes.Repeat([]byte{0x00}, c.PayloadLength)
-	var port int
+	var srcPort, dstPort int
+	var packetID int
 	for {
 		select {
 		case <-ctx.Done():
@@ -318,18 +325,23 @@ func (c *Continuous) generatePackets(ctx context.Context, jobs chan packet) erro
 						c.Destinations[i].IP = addr
 					}
 				}
-				for ttl, socket := range sockets {
-					port = c.nextPort(port)
+				for ttl := 1; ttl <= c.MaxTTL; ttl++ {
+					srcPort = c.nextPort(srcPort)
+					dstPort = c.nextPort(srcPort) // this looks wrong, but isn't.
+					// We want to ensure that src and dst port pairings vary, so
+					// we base the dstPort on the srcPort.
+					packetID = (packetID + 1) % math.MaxUint16
+					pkt := newUDPPacket(dest.IP, srcPort, dstPort, ttl, packetID, payload)
 					p := packet{
 						start:      time.Now().UTC(),
 						ttl:        ttl,
 						dest:       dest,
-						port:       port,
 						generation: generation,
+						id:         c.packetID(packetID, dest.IP, srcPort, dstPort),
 					}
 					var b [4]byte
 					copy(b[:], dest.IP.To4())
-					err := syscall.Sendto(socket, payload, 0, &syscall.SockaddrInet4{Port: port, Addr: b})
+					err := syscall.Sendto(socket, pkt, 0, &syscall.SockaddrInet4{Port: dstPort, Addr: b})
 					if err != nil {
 						c.logger.WithError(err).WithField("address", dest.Host).Error("Sendto error")
 						continue
@@ -415,7 +427,7 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 	go c.readICMP(ctx, messages)
 	jobs := make(chan packet, 1)
 	go c.generatePackets(ctx, jobs)
-	inProgress := map[int]packet{}
+	inProgress := map[string]packet{}
 	hops := map[string]map[int][]*Hop{} // hops by generation by destination
 	for {
 		select {
@@ -426,7 +438,7 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 				return errors.New("message channel closed")
 			}
 			var err error
-			p, ok := inProgress[msg.DstPort]
+			p, ok := inProgress[msg.ID]
 			if !ok {
 				err = fmt.Errorf("no matching in progress address")
 			} else {
@@ -435,7 +447,7 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 				msg.Dst.Host = p.dest.Host
 				msg.Elapsed = msg.Received.Sub(msg.Sent)
 				msg.Generation = p.generation
-				delete(inProgress, msg.DstPort)
+				delete(inProgress, msg.ID)
 			}
 			c.logger.WithError(err).WithFields(msg).Action("traceroute")
 			if ok {
@@ -453,7 +465,7 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 			if !ok {
 				return errors.New("jobs channel closed")
 			}
-			inProgress[p.port] = p
+			inProgress[p.id] = p
 			// TODO: purge the old ones
 		case fn := <-reports:
 			r := c.makeReports(hops)
