@@ -247,23 +247,26 @@ func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
 	for ctx.Err() == nil {
 		var p = make([]byte, 100)
 		n, _, err := syscall.Recvfrom(recvSocket, p, 0)
+		now := time.Now().UTC()
 		if err != nil {
 			c.logger.WithError(err).Error("Recvfrom error")
 			time.Sleep(10 * time.Millisecond)
 		} else {
+			// extractMessage has to do reverse DNS lookups, which (at least on my machine) seem to get throttled,
+			// and this messes up the elapsed time calculation (by backing up the Recvfrom loop). So, we do it
+			// in its own goroutine.
+			go func(now time.Time, p []byte, n int, err error) {
+				if err != nil {
+					return
+				}
+				msg, err := c.extractMessage(p[:n], now)
+				if err != nil {
+					c.logger.WithError(err).Error("extractMessage error")
+					return
+				}
+				hops <- msg
+			}(now, p, n, err)
 		}
-		go func(p []byte, n int, err error) {
-			now := time.Now().UTC()
-			if err != nil {
-				return
-			}
-			msg, err := c.extractMessage(p[:n], now)
-			if err != nil {
-				c.logger.WithError(err).Error("extractMessage error")
-				return
-			}
-			hops <- msg
-		}(p, n, err)
 	}
 	return ctx.Err()
 }
@@ -382,8 +385,7 @@ func (c *Continuous) makeReports(data map[string]map[int][]*Hop) []Report {
 	return all
 }
 
-func (c *Continuous) newReport(destination Addr, generations map[int][]*Hop) Report {
-	var first, last int
+func (c *Continuous) findGenerationWindow(generations map[int][]*Hop) (first int, last int) {
 	for gen := range generations {
 		if first == 0 || gen < first {
 			first = gen
@@ -398,6 +400,11 @@ func (c *Continuous) newReport(destination Addr, generations map[int][]*Hop) Rep
 	for last-first > c.Generations {
 		first++
 	}
+	return
+}
+
+func (c *Continuous) newReport(destination Addr, generations map[int][]*Hop) Report {
+	first, last := c.findGenerationWindow(generations)
 	var hops []*Hop
 	for gen := first; gen < last; gen++ {
 		hops = append(hops, generations[gen]...)
@@ -459,14 +466,27 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 				messages := hops[key][msg.Generation]
 				messages = append(messages, msg)
 				hops[key][msg.Generation] = messages
+				// purge the old ones
+				first, _ := c.findGenerationWindow(hops[key])
+				for gen := range hops[key] {
+					if gen < first {
+						delete(hops[key], gen)
+					}
+				}
 			}
-			// TODO: purge the old ones
 		case p, ok := <-jobs:
 			if !ok {
 				return errors.New("jobs channel closed")
 			}
 			inProgress[p.id] = p
-			// TODO: purge the old ones
+			// the ones that don't respond will accumulate unless we purge them periodically.
+			oldest := time.Duration(c.Generations) * c.Timeout
+			for id, p := range inProgress {
+				age := time.Since(p.start)
+				if age > oldest {
+					delete(inProgress, id)
+				}
+			}
 		case fn := <-reports:
 			r := c.makeReports(hops)
 			fn(r)
