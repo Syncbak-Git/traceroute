@@ -10,6 +10,7 @@ func printHop(hop TracerouteHop) {
 }
 
 func TestTraceroute(t *testing.T) {
+	t.Skip("needs to run as root")
 	fmt.Println("Testing synchronous traceroute")
 	out, err := Traceroute("google.com", new(TracerouteOptions))
 	if err == nil {
@@ -27,6 +28,7 @@ func TestTraceroute(t *testing.T) {
 }
 
 func TestTraceouteChannel(t *testing.T) {
+	t.Skip("needs to run as root")
 	fmt.Println("Testing asynchronous traceroute")
 	c := make(chan TracerouteHop, 0)
 	go func() {

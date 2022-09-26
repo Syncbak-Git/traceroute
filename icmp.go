@@ -156,6 +156,7 @@ func (r *Hop) Fields() log.Fields {
 		"sent":       r.Sent.Format(time.RFC3339Nano),
 		"received":   r.Received.Format(time.RFC3339Nano),
 		"elapsed":    r.Elapsed.Seconds(),
+		"ms":         r.Elapsed.Milliseconds(),
 		"generation": r.Generation,
 	}
 }
@@ -230,6 +231,7 @@ func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
 		return err
 	}
 	defer syscall.Close(recvSocket)
+	/////////////////////////////////////////
 	// TODO: do we need a receive timeout if we're running continuously?
 	// we do, if we want ctx.Done() to exit the recvfrom loop, otherwise it blocks forever
 	// once we stop sending requests
@@ -239,6 +241,7 @@ func (c *Continuous) readICMP(ctx context.Context, hops chan *Hop) error {
 	// 	// this one isn't really fatal, but we'll treat it as so, because it's a really bad sign
 	// 	return err
 	// }
+	//////////////////////////////////////////
 	err = syscall.Bind(recvSocket, &syscall.SockaddrInet4{Port: c.FirstPort, Addr: localAddr})
 	if err != nil {
 		// again, this is fatal
