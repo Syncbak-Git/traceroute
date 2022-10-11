@@ -34,13 +34,13 @@ type Continuous struct {
 	Destinations  []Addr
 	Generations   int
 	PayloadLength int
-	logger        *log.Logger
+	logger        log.Interface
 }
 
 // NewContinuous returns a new Continuous for monitoring the
 // supplied destinations using the default options. The supplied Logger, if non-nil,
 // will be used for logging.
-func NewContinuous(destinations []string, logger *log.Logger) (*Continuous, error) {
+func NewContinuous(destinations []string, logger log.Interface) (*Continuous, error) {
 	if logger == nil {
 		d := discard.New()
 		logger = &log.Logger{
