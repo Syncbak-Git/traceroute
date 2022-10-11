@@ -35,6 +35,7 @@ type Continuous struct {
 	Generations   int
 	PayloadLength int
 	logger        log.Interface
+	reports       chan (func([]Report))
 }
 
 // NewContinuous returns a new Continuous for monitoring the
@@ -66,6 +67,7 @@ func NewContinuous(destinations []string, logger log.Interface) (*Continuous, er
 		Generations:   3,
 		PayloadLength: 1,
 		logger:        logger,
+		reports:       make(chan func([]Report)),
 	}, nil
 }
 
@@ -159,6 +161,17 @@ func (r *Hop) Fields() log.Fields {
 		"ms":         r.Elapsed.Milliseconds(),
 		"generation": r.Generation,
 	}
+}
+
+func (c *Continuous) Reports() []Report {
+	done := make(chan func([]Report))
+	var all []Report
+	c.reports <- func(rr []Report) {
+		all = rr
+		close(done)
+	}
+	<-done
+	return all
 }
 
 func (c *Continuous) extractMessage(p []byte, now time.Time) (*Hop, error) {
@@ -431,7 +444,7 @@ func (c *Continuous) newReport(destination Addr, generations map[int][]*Hop) Rep
 
 // Run runs a continous traceroute to the Continuous.Destinations. Except for
 // initialization errors, Run will not return until the supplied context is Done.
-func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) error {
+func (c *Continuous) Run(ctx context.Context) error {
 	// launch the listener
 	messages := make(chan *Hop, 1)
 	go c.readICMP(ctx, messages)
@@ -490,7 +503,7 @@ func (c *Continuous) Run(ctx context.Context, reports <-chan func([]Report)) err
 					delete(inProgress, id)
 				}
 			}
-		case fn := <-reports:
+		case fn := <-c.reports:
 			r := c.makeReports(hops)
 			fn(r)
 		}
