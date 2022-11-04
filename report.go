@@ -39,7 +39,7 @@ func (r Report) String() string {
 				name:          hop.Node.Host,
 				address:       hop.Node.IP.String(),
 				durations:     []time.Duration{hop.Elapsed},
-				atDestination: hop.icmpType == 3,
+				atDestination: hop.icmpType == 3 || hop.Node.IP.String() == r.Destination.IP.String() || hop.Node.Host == r.Destination.Host,
 			}
 			all[hop.Step] = append(all[hop.Step], e)
 		}
