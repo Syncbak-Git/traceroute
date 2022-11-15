@@ -40,8 +40,8 @@ type Continuous struct {
 
 // NewContinuous returns a new Continuous for monitoring the
 // supplied destinations using the default options. The supplied Logger, if non-nil,
-// will be used for logging.
-func NewContinuous(destinations []string, logger log.Interface) (*Continuous, error) {
+// will be used for logging. Invalid destinations will be skipped.
+func NewContinuous(destinations []string, logger log.Interface) *Continuous {
 	if logger == nil {
 		d := discard.New()
 		logger = &log.Logger{
@@ -54,7 +54,8 @@ func NewContinuous(destinations []string, logger log.Interface) (*Continuous, er
 	for i, host := range destinations {
 		ip, err := ipAddress(host)
 		if err != nil {
-			return nil, fmt.Errorf("could not resolve %s: %s", host, err)
+			logger.WithError(err).Errorf("could not resolve %s", host)
+			continue
 		}
 		dest[i] = Addr{Host: host, IP: ip}
 	}
@@ -68,7 +69,7 @@ func NewContinuous(destinations []string, logger log.Interface) (*Continuous, er
 		PayloadLength: 1,
 		logger:        logger,
 		reports:       make(chan func([]Report)),
-	}, nil
+	}
 }
 
 // Hop is a step in the network route between a source and destination address.
