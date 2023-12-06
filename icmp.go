@@ -192,6 +192,8 @@ func (c *Continuous) extractMessage(p []byte, now time.Time) (*Hop, error) {
 		data = te.Data
 	} else if du, ok := msg.Body.(*icmp.DstUnreach); ok {
 		data = du.Data
+	} else if echo, ok := msg.Body.(*icmp.Echo); ok {
+		data = echo.Data
 	} else {
 		return nil, fmt.Errorf("Unknown message type: %v", msg.Type)
 	}
